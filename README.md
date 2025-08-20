@@ -150,16 +150,24 @@ Your RPL 3.0 platform password
    - Check that `activity.json` and `files_metadata` are properly formatted
 
 
+## Manual testing
+
+You can check the output of the changes detection script manually by running the following command:
+
+```bash
+./detect_changes.sh > changes.txt
+```
+
 ---
 
 ## Development testing (DEVELOPMENT ONLY, FOR DEBUGGING PURPOSES)
 
 
 > [!CAUTION]
-> Note that this is only for testing of a local instance of RPL 3.0, not for normal usage. 
-> If the url parameters point to the production APIs it WILL AFFECT your course and activities
+> Note that this is for testing of a local instance of RPL 3.0, not intended for normal usage.
+> It can be used, but if the url parameters point to the production APIs it WILL AFFECT your course and activities, so use with caution. We also discourage using this manually since your credentials will be exposed in the command line history (which is not the case when using the GitHub Action since you define the credentials as secrets).
 
-You can test the action manually by running the following command:
+If you are testing a local instance of RPL 3.0, you can run the following commands manually process them on your local environment:
 ```bash
 ./detect_changes.sh > changes.txt
 cat changes.txt | RPL_USERNAME=your_username RPL_PASSWORD=your_password USERS_API_BASE_URL=http://localhost:8000/api/v3 ACTIVITIES_API_BASE_URL=http://localhost:8001/api/v3 ./process_activities_changes.sh
