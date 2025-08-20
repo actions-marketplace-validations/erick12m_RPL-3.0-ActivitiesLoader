@@ -5,6 +5,7 @@ ACTIVITIES_API_BASE_URL="${ACTIVITIES_API_BASE_URL:-http://192.168.49.2:30002}"
 USERS_API_BASE_URL="${USERS_API_BASE_URL:-http://192.168.49.2:30001}"
 RPL_USERNAME="${RPL_USERNAME:-testadmin}"
 RPL_PASSWORD="${RPL_PASSWORD:-test}"
+
 AUTH_TOKEN=""
 
 # Colors for logging
@@ -30,6 +31,68 @@ log_error() {
     echo -e "${RED}[ERROR]${NO_COLOR} $1" >&2
 }
 
+health_request() {
+    local api_base_url="$1"
+    local timeout="${2:-10}"
+    
+    local url="${api_base_url}/health"
+    local response
+    
+    response=$(curl -s --max-time "$timeout" \
+        -H "Accept: application/json" \
+        "$url" 2>/dev/null || echo "")
+    
+    if [[ -z "$response" ]]; then
+        return 1
+    fi
+    
+    # Check if response contains "pong"
+    if [[ "$response" == *"pong"* ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Health check functions
+check_api_health() {
+    local api_url="$1"
+    local api_name="$2"
+    local timeout="${3:-10}"
+    
+    log_info "Checking health of $api_name at $api_url"
+    
+    if health_request "$api_url" "$timeout"; then
+        log_success "$api_name is reachable and healthy"
+        return 0
+    else
+        log_error "$api_name at $api_url is not reachable"
+        return 1
+    fi
+}
+
+perform_health_checks() {
+    log_info "Performing API health checks"
+    
+    local health_check_failed=false
+    
+    if ! check_api_health "$USERS_API_BASE_URL" "Users API"; then
+        health_check_failed=true
+    fi
+    
+    if ! check_api_health "$ACTIVITIES_API_BASE_URL" "Activities API"; then
+        health_check_failed=true
+    fi
+    
+    if [[ "$health_check_failed" == "true" ]]; then
+        log_error "Health checks failed. Cannot proceed with processing."
+        exit 1
+    fi
+    
+    log_success "All API health checks passed"
+}
+
+# API request functions
 auth_request() {
     local method="$1"
     local endpoint="$2"
@@ -79,11 +142,50 @@ multipart_api_request() {
         echo "$response"
         return 0
     else
-        log_error "Response: $response"
+        log_error "HTTP $http_code - Response: $response"
         return 1
     fi
 }
 
+api_request() {
+    local method="$1"
+    local endpoint="$2"
+    local data="$3"
+    local content_type="${4:-application/json}"
+    
+    local url="${ACTIVITIES_API_BASE_URL}${endpoint}"
+    local response
+    local http_code
+    
+    if [[ "$method" == "GET" ]]; then
+        response=$(curl -s -w "%{http_code}" -X "$method" \
+            -H "Authorization: Bearer $AUTH_TOKEN" \
+            -H "Accept: application/json" \
+            "$url")
+    else
+        response=$(curl -s -w "%{http_code}" -X "$method" \
+            -H "Authorization: Bearer $AUTH_TOKEN" \
+            -H "Content-Type: $content_type" \
+            -H "Accept: application/json" \
+            -d "$data" \
+            "$url")
+    fi
+
+    http_code="${response: -3}"
+    response="${response%???}"
+    
+    # Success
+    if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+        echo "$response"
+        return 0
+    else
+        log_error "HTTP $http_code - Response: $response"
+        echo "$response"
+        return 1
+    fi
+}
+
+# Environment and authentication functions
 check_env() {
     if [[ -z "$RPL_USERNAME" ]]; then
         log_error "Username is required"
@@ -95,7 +197,7 @@ check_env() {
         exit 1
     fi
     
-    log_info "Env validated"
+    log_info "Environment validation passed"
 }
 
 authenticate() {
@@ -131,45 +233,106 @@ authenticate() {
     log_success "Authentication successful"
 }
 
-api_request() {
-    local method="$1"
-    local endpoint="$2"
-    local data="$3"
-    local content_type="${4:-application/json}"
+# Validation functions
+validate_activity_json() {
+    local activity_json="$1"
     
-    local url="${ACTIVITIES_API_BASE_URL}${endpoint}"
-
-    local response
-    local http_code
-    
-    if [[ "$method" == "GET" ]]; then
-        response=$(curl -s -w "%{http_code}" -X "$method" \
-            -H "Authorization: Bearer $AUTH_TOKEN" \
-            -H "Accept: application/json" \
-            "$url")
-    else
-        response=$(curl -s -w "%{http_code}" -X "$method" \
-            -H "Authorization: Bearer $AUTH_TOKEN" \
-            -H "Content-Type: $content_type" \
-            -H "Accept: application/json" \
-            -d "$data" \
-            "$url")
-    fi
-
-    http_code="${response: -3}"
-    response="${response%???}"
-    
-    # Success
-    if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
-        echo "$response"
-        return 0
-    else
-        log_error "Response: $response"
-        echo "$response"
+    if [[ ! -f "$activity_json" ]]; then
+        log_error "activity.json not found: $activity_json"
         return 1
     fi
+    
+    # Check JSON syntax
+    if ! jq empty "$activity_json" 2>/dev/null; then
+        log_error "Invalid JSON syntax in: $activity_json"
+        return 1
+    fi
+    
+    # Check required fields
+    local name=$(jq -r '.name' "$activity_json")
+    local category_name=$(jq -r '.category_name // .category' "$activity_json")
+    local language=$(jq -r '.language' "$activity_json")
+    
+    if [[ "$name" == "null" ]]; then
+        log_error "Missing required field 'name' in $activity_json"
+        return 1
+    fi
+    
+    if [[ "$category_name" == "null" || "$language" == "null" ]]; then
+        log_error "Missing required fields in $activity_json (category_name or category, language)"
+        return 1
+    fi
+    
+    log_success "activity.json validation passed"
+    return 0
 }
 
+validate_files_metadata() {
+    local activity_dir="$1"
+    local files_metadata_path="$activity_dir/files_metadata"
+
+    log_info "Validating files_metadata format"
+    
+    if [[ ! -f "$files_metadata_path" ]]; then
+        log_error "files_metadata is mandatory but not found in $activity_dir"
+        return 1
+    fi
+    
+    # Check if it's valid JSON
+    if ! jq empty "$files_metadata_path" 2>/dev/null; then
+        log_error "files_metadata is not valid JSON in $activity_dir"
+        return 1
+    fi
+    
+    # Validate structure and allowed display values
+    local validation_result
+    validation_result=$(jq -r '
+        to_entries[] | 
+        select(.value.display and (.value.display | IN("read", "read_write", "hidden") | not)) | 
+        "Invalid display value: " + .value.display + " for file: " + .key
+    ' "$files_metadata_path")
+    
+    if [[ -n "$validation_result" ]]; then
+        log_error "$validation_result"
+        return 1
+    fi
+    
+    # Check if all referenced files exist in activity directory
+    local missing_files
+    missing_files=$(jq -r 'keys[]' "$files_metadata_path" | while read -r filename; do
+        if [[ ! -f "$activity_dir/$filename" ]]; then
+            echo "File referenced in files_metadata but not found: $filename"
+        fi
+    done)
+    
+    if [[ -n "$missing_files" ]]; then
+        log_error "$missing_files"
+        return 1
+    fi
+    
+    log_success "files_metadata validation passed"
+    return 0
+}
+
+validate_activity_structure() {
+    local activity_dir="$1"
+    local activity_json="$activity_dir/activity.json"
+    
+    log_info "Validating activity structure for: $(basename "$activity_dir")"
+    
+    if ! validate_activity_json "$activity_json"; then
+        return 1
+    fi
+    
+    if ! validate_files_metadata "$activity_dir"; then
+        return 1
+    fi
+    
+    log_success "Activity structure validation passed"
+    return 0
+}
+
+# Category management functions
 get_existing_categories() {
     local course_id="$1"
     log_info "Fetching existing categories for course $course_id"
@@ -225,7 +388,7 @@ analyze_category() {
     # Get existing categories
     local existing_categories=$(get_existing_categories "$course_id")
     
-    # Check if category already exist
+    # Check if category already exists
     local category_id=$(echo "$existing_categories" | jq -r ".[] | select(.name == \"$category_name\") | .id" | head -1)
     
     if [[ -n "$category_id" && "$category_id" != "null" ]]; then
@@ -234,7 +397,7 @@ analyze_category() {
         return 0
     fi
     
-    # Category don't exist, create it
+    # Category doesn't exist, create it
     log_info "Category '$category_name' not found, creating it"
     
     local response=$(create_category "$course_id" "$category_name" "$category_description")
@@ -255,6 +418,7 @@ analyze_category() {
     fi
 }
 
+# Activity management functions
 get_existing_activities() {
     local course_id="$1"
     log_info "Fetching existing activities for course $course_id"
@@ -265,6 +429,42 @@ get_activity_details() {
     local course_id="$1"
     local activity_id="$2"
     api_request "GET" "/courses/$course_id/activities/$activity_id"
+}
+
+build_activity_form_data() {
+    local course_id="$1"
+    local category_id="$2"
+    local name="$3"
+    local description="$4"
+    local language="$5"
+    local points="$6"
+    local active="$7"
+    local compilation_flags="$8"
+    local activity_dir="$9"
+    local form_data_var_name="${10}"
+    
+    local -n form_data_ref="$form_data_var_name"
+    
+    form_data_ref=(-F "category_id=$category_id")
+    form_data_ref+=(-F "name=$name")
+    form_data_ref+=(-F "description=$description")
+    form_data_ref+=(-F "language=$language")
+    form_data_ref+=(-F "points=$points")
+    form_data_ref+=(-F "active=$active")
+    
+    if [[ -n "$compilation_flags" ]]; then
+        form_data_ref+=(-F "compilation_flags=$compilation_flags")
+    fi
+    
+    # Add files to form_data array
+    if [[ -n "$activity_dir" ]]; then
+        while IFS= read -r -d '' file; do
+            local filename=$(basename "$file")
+            if [[ "$filename" != "activity.json" && "$filename" != "io_tests.json" && ! "$filename" =~ ^unit_tests\..*$ ]]; then
+                form_data_ref+=(-F "starting_files=@$file")
+            fi
+        done < <(find "$activity_dir" -type f -print0)
+    fi
 }
 
 create_activity() {
@@ -280,26 +480,8 @@ create_activity() {
     
     log_info "Creating activity: $name for course $course_id"
     
-    local form_data=(-F "category_id=$category_id")
-    form_data+=(-F "name=$name")
-    form_data+=(-F "description=$description")
-    form_data+=(-F "language=$language")
-    form_data+=(-F "points=$points")
-    form_data+=(-F "active=$active")
-    
-    if [[ -n "$compilation_flags" ]]; then
-        form_data+=(-F "compilation_flags=$compilation_flags")
-    fi
-    
-    # Add files to form_data array
-    if [[ -n "$activity_dir" ]]; then
-        while IFS= read -r -d '' file; do
-            local filename=$(basename "$file")
-            if [[ "$filename" != "activity.json" && "$filename" != "io_tests.json" && ! "$filename" =~ ^unit_tests\..*$ ]]; then
-                form_data+=(-F "starting_files=@$file")
-            fi
-        done < <(find "$activity_dir" -type f -print0)
-    fi
+    local form_data
+    build_activity_form_data "$course_id" "$category_id" "$name" "$description" "$language" "$points" "$active" "$compilation_flags" "$activity_dir" "form_data"
     
     local response
     if response=$(multipart_api_request "POST" "/courses/$course_id/activities" "form_data"); then
@@ -325,26 +507,8 @@ update_activity() {
     
     log_info "Updating activity: $name (ID: $activity_id) for course $course_id"
     
-    local form_data=(-F "category_id=$category_id")
-    form_data+=(-F "name=$name")
-    form_data+=(-F "description=$description")
-    form_data+=(-F "language=$language")
-    form_data+=(-F "points=$points")
-    form_data+=(-F "active=$active")
-    
-    if [[ -n "$compilation_flags" ]]; then
-        form_data+=(-F "compilation_flags=$compilation_flags")
-    fi
-    
-    # Add files to form_data array
-    if [[ -n "$activity_dir" ]]; then
-        while IFS= read -r -d '' file; do
-            local filename=$(basename "$file")
-            if [[ "$filename" != "activity.json" && "$filename" != "io_tests.json" && ! "$filename" =~ ^unit_tests\..*$ ]]; then
-                form_data+=(-F "starting_files=@$file")
-            fi
-        done < <(find "$activity_dir" -type f -print0)
-    fi
+    local form_data
+    build_activity_form_data "$course_id" "$category_id" "$name" "$description" "$language" "$points" "$active" "$compilation_flags" "$activity_dir" "form_data"
     
     local response
     if response=$(multipart_api_request "PATCH" "/courses/$course_id/activities/$activity_id" "form_data"); then
@@ -354,6 +518,76 @@ update_activity() {
         log_error "Failed to update activity: $name"
         return 1
     fi
+}
+
+# Test processing functions
+create_io_test() {
+    local course_id="$1"
+    local activity_id="$2"
+    local name="$3"
+    local test_in="$4"
+    local test_out="$5"
+    
+    local data=$(jq -n \
+        --arg name "$name" \
+        --arg test_in "$test_in" \
+        --arg test_out "$test_out" \
+        '{
+            name: $name,
+            test_in: $test_in,
+            test_out: $test_out
+        }')
+    
+    api_request "POST" "/courses/$course_id/activities/$activity_id/iotests" "$data"
+}
+
+update_io_test() {
+    local course_id="$1"
+    local activity_id="$2"
+    local io_test_id="$3"
+    local name="$4"
+    local test_in="$5"
+    local test_out="$6"
+    
+    local data=$(jq -n \
+        --arg name "$name" \
+        --arg test_in "$test_in" \
+        --arg test_out "$test_out" \
+        '{
+            name: $name,
+            test_in: $test_in,
+            test_out: $test_out
+        }')
+    
+    api_request "PUT" "/courses/$course_id/activities/$activity_id/iotests/$io_test_id" "$data"
+}
+
+create_unit_tests() {
+    local course_id="$1"
+    local activity_id="$2"
+    local unit_test_code="$3"
+    
+    local data=$(jq -n \
+        --arg code "$unit_test_code" \
+        '{
+            unit_tests_code: $code
+        }')
+    
+    api_request "POST" "/courses/$course_id/activities/$activity_id/unittests" "$data"
+}
+
+update_unit_tests() {
+    local course_id="$1"
+    local activity_id="$2"
+    local unit_test_code="$3"
+    
+    local data=$(jq -n \
+        --arg code "$unit_test_code" \
+        '{
+            unit_tests_code: $code
+        }')
+    
+    api_request "PUT" "/courses/$course_id/activities/$activity_id/unittests" "$data"
 }
 
 process_io_tests() {
@@ -370,7 +604,7 @@ process_io_tests() {
     local activity_details=$(get_activity_details "$course_id" "$activity_id")
     local unit_tests_data=$(echo "$activity_details" | jq -r '.activity_unit_tests_content // empty')
     if [[ -n "$unit_tests_data" ]]; then
-        log_warning "Activity: $name has unit tests. Cannot add IO tests."
+        log_warning "Activity has unit tests. Cannot add IO tests."
         return 0
     fi
     
@@ -437,7 +671,7 @@ process_unit_tests() {
     local has_io_tests=$(echo "$activity_details" | jq -r '.activity_io_tests | length > 0')
     
     if [[ "$has_io_tests" == "true" ]]; then
-        log_warning "Activity: $name has IO tests. Cannot add unit tests."
+        log_warning "Activity has IO tests. Cannot add unit tests."
         return 0
     fi
     
@@ -485,95 +719,75 @@ process_unit_tests() {
     return 0
 }
 
-create_io_test() {
-    local course_id="$1"
-    local activity_id="$2"
-    local name="$3"
-    local test_in="$4"
-    local test_out="$5"
+# Test management helper
+determine_test_types() {
+    local activity_dir="$1"
+    local has_io_tests_var="$2"
+    local has_unit_tests_var="$3"
     
-    local data=$(jq -n \
-        --arg name "$name" \
-        --arg test_in "$test_in" \
-        --arg test_out "$test_out" \
-        '{
-            name: $name,
-            test_in: $test_in,
-            test_out: $test_out
-        }')
+    local -n has_io_tests_ref="$has_io_tests_var"
+    local -n has_unit_tests_ref="$has_unit_tests_var"
     
-    api_request "POST" "/courses/$course_id/activities/$activity_id/iotests" "$data"
+    has_io_tests_ref=false
+    has_unit_tests_ref=false
+    
+    if [[ -f "$activity_dir/io_tests.json" ]]; then
+        has_io_tests_ref=true
+    fi
+    
+    # Check for unit tests file with any extension
+    for file in "$activity_dir"/unit_tests.*; do
+        if [[ -f "$file" ]]; then
+            has_unit_tests_ref=true
+            break
+        fi
+    done
+    
+    # Check if both test types are present
+    if [[ "$has_io_tests_ref" == "true" && "$has_unit_tests_ref" == "true" ]]; then
+        local activity_name=$(basename "$activity_dir")
+        log_warning "Activity: $activity_name in $activity_dir has both IO tests and unit tests."
+        log_warning "Processing IO tests first - unit tests will be ignored."
+        log_warning "Create a new activity for unit test."
+        has_unit_tests_ref=false
+    fi
 }
 
-update_io_test() {
+process_tests() {
     local course_id="$1"
     local activity_id="$2"
-    local io_test_id="$3"
-    local name="$4"
-    local test_in="$5"
-    local test_out="$6"
+    local activity_dir="$3"
+    local activity_name="$4"
     
-    local data=$(jq -n \
-        --arg name "$name" \
-        --arg test_in "$test_in" \
-        --arg test_out "$test_out" \
-        '{
-            name: $name,
-            test_in: $test_in,
-            test_out: $test_out
-        }')
+    local has_io_tests has_unit_tests
+    determine_test_types "$activity_dir" "has_io_tests" "has_unit_tests"
     
-    api_request "PUT" "/courses/$course_id/activities/$activity_id/iotests/$io_test_id" "$data"
+    if [[ "$has_io_tests" == "true" ]]; then
+        log_info "Processing IO tests for: $activity_name"
+        if ! process_io_tests "$course_id" "$activity_id" "$activity_dir"; then
+            log_error "Failed to process IO tests for: $activity_name in $activity_dir"
+            return 1
+        fi
+    elif [[ "$has_unit_tests" == "true" ]]; then
+        log_info "Processing unit tests for: $activity_name"
+        if ! process_unit_tests "$course_id" "$activity_id" "$activity_dir"; then
+            log_error "Failed to process unit tests for: $activity_name in $activity_dir"
+            return 1
+        fi
+    else
+        log_warning "No test files found for: $activity_name"
+    fi
+    
+    return 0
 }
 
-create_unit_tests() {
-    local course_id="$1"
-    local activity_id="$2"
-    local unit_test_code="$3"
-    
-    local data=$(jq -n \
-        --arg code "$unit_test_code" \
-        '{
-            unit_tests_code: $code
-        }')
-    
-    api_request "POST" "/courses/$course_id/activities/$activity_id/unittests" "$data"
-    
-}
-
-update_unit_tests() {
-    local course_id="$1"
-    local activity_id="$2"
-    local unit_test_code="$3"
-    
-    local data=$(jq -n \
-        --arg code "$unit_test_code" \
-        '{
-            unit_tests_code: $code
-        }')
-    
-    api_request "PUT" "/courses/$course_id/activities/$activity_id/unittests" "$data"
-}
-
-process_activity() {
+extract_activity_data() {
     local course_id="$1"
     local activity_dir="$2"
-    local activity_name=$(basename "$activity_dir")
-    
-    log_info "Processing activity: $activity_name in course $course_id"
-    
     local activity_json="$activity_dir/activity.json"
-    if [[ ! -f "$activity_json" ]]; then
-        log_error "activity.json not found in $activity_dir"
-        return 1
-    fi
     
+    # Extract activity data
     local name=$(jq -r '.name' "$activity_json")
-    if [[ "$name" == "null" ]]; then
-        log_error "Missing required field 'name' in $activity_json"
-        return 1
-    fi
-    
     local category_name=$(jq -r '.category_name // .category' "$activity_json")
     local category_description=$(jq -r '.category_description // ""' "$activity_json")
     local description=$(jq -r '.description // ""' "$activity_json")
@@ -581,21 +795,25 @@ process_activity() {
     local points=$(jq -r '.points // 100' "$activity_json")
     local active=$(jq -r '.active // true' "$activity_json")
     local compilation_flags=$(jq -r '.compilation_flags // ""' "$activity_json")
+    
+    echo "$name|$category_name|$category_description|$description|$language|$points|$active|$compilation_flags"
+}
 
+process_activity_crud() {
+    local course_id="$1"
+    local activity_dir="$2"
+    local activity_data="$3"
     
-    # required fields
-    if [[ "$category_name" == "null" || "$language" == "null" ]]; then
-        log_error "Missing required fields in $activity_json (category_name or category, language)"
-        return 1
-    fi
+    IFS='|' read -r name category_name category_description description language points active compilation_flags <<< "$activity_data"
     
+    # Resolve category
     local category_id
     if ! category_id=$(analyze_category "$course_id" "$category_name" "$category_description"); then
-        log_error "Failed to resolve category: $category_name for activity in $activity_dir" 
+        log_error "Failed to resolve category: $category_name for activity in $activity_dir"
         return 1
     fi
     
-    # Check if activity  exists
+    # Check if activity exists
     local existing_activities=$(get_existing_activities "$course_id")
     local activity_id=$(echo "$existing_activities" | jq -r ".[] | select(.name == \"$name\") | .id" | head -1)
     
@@ -605,6 +823,8 @@ process_activity() {
         # Update existing activity
         if activity_response=$(update_activity "$course_id" "$activity_id" "$category_id" "$name" "$description" "$language" "$points" "$active" "$compilation_flags" "$activity_dir"); then
             log_success "Updated activity: $name"
+            echo "$activity_id"
+            return 0
         else
             log_error "Failed to update activity: $name in $activity_dir"
             return 1
@@ -618,61 +838,66 @@ process_activity() {
                 log_error "Failed to extract activity ID from response for activity in $activity_dir"
                 return 1
             fi
+            echo "$activity_id"
+            return 0
         else
             log_error "Failed to create activity: $name in $activity_dir"
             return 1
         fi
     fi
+}
+
+process_activity() {
+    local course_id="$1"
+    local activity_dir="$2"
+    local activity_name=$(basename "$activity_dir")
     
-    local has_io_tests=false
-    local has_unit_tests=false
+    log_info "Processing activity: $activity_name in course $course_id"
     
-    if [[ -f "$activity_dir/io_tests.json" ]]; then
-        has_io_tests=true
+    # Validate activity structure
+    if ! validate_activity_structure "$activity_dir"; then
+        log_error "Activity structure validation failed for activity in $activity_dir"
+        return 1
     fi
     
-    # Check for unit tests file with any extension
-    for file in "$activity_dir"/unit_tests.*; do
-        if [[ -f "$file" ]]; then
-            has_unit_tests=true
-            break
-        fi
-    done
-    
-    # Check if both test types are present
-    if [[ "$has_io_tests" == "true" && "$has_unit_tests" == "true" ]]; then
-        log_warning "Activity: $name in $activity_dir has both IO tests and unit tests."
-        log_warning "Processing IO tests first - unit tests will be ignored."
-        log_warning "Create a new activity for unit test."
-        has_unit_tests=false
+    # Extract activity data
+    local activity_data
+    if ! activity_data=$(extract_activity_data "$course_id" "$activity_dir"); then
+        log_error "Failed to extract activity data for activity in $activity_dir"
+        return 1
     fi
     
-    if [[ "$has_io_tests" == "true" ]]; then
-        log_info "Processing IO tests for: $name"
-        if ! process_io_tests "$course_id" "$activity_id" "$activity_dir"; then
-            log_error "Failed to process IO tests for: $name in $activity_dir"
-            return 1
-        fi
-    elif [[ "$has_unit_tests" == "true" ]]; then
-        log_info "Processing unit tests for: $name"
-        if ! process_unit_tests "$course_id" "$activity_id" "$activity_dir"; then
-            log_error "Failed to process unit tests for: $name in $activity_dir"
-            return 1
-        fi
-    else
-        log_warning "No test files found for: $name"
+    # Create or update activity
+    local activity_id
+    if ! activity_id=$(process_activity_crud "$course_id" "$activity_dir" "$activity_data"); then
+        log_error "Failed to create/update activity in $activity_dir"
+        return 1
     fi
     
-    log_info "Completed processing activity: $name"
+    # Process tests
+    if ! process_tests "$course_id" "$activity_id" "$activity_dir" "$activity_name"; then
+        log_error "Failed to process tests for activity in $activity_dir"
+        return 1
+    fi
+    
+    log_info "Completed processing activity: $activity_name"
     return 0
 }
 
 main() {
-    log_info "Starting RPL Activities Processing"
+    echo ""
+    log_info "Starting RPL Activities Batch Processing..."
+    echo ""
     
+    echo "============================================================"
+    echo "                  INITIAL VALIDATIONS"
     check_env
+    perform_health_checks
     authenticate
-    
+
+    echo "============================================================"
+    echo "                  PROCESSING ACTIVITIES"
+
     # Read changed files from stdin or as arguments
     local changed_files_input=""
     if [[ $# -eq 0 ]]; then
@@ -729,11 +954,8 @@ main() {
             
             # Mark this activity as processed
             processed_activities[$activity_key]=1
-            
-            log_info "Processing activity: $activity_name in course $course_id (triggered by: $filename)"
-            
-            # Process the entire activity 
-            if process_activity "$course_id" "$activity_dir" ""; then
+                        
+            if process_activity "$course_id" "$activity_dir"; then
                 succeeded_activities+=("$activity_name (course: $course_id)")
                 ((success_count++))
             else
@@ -747,42 +969,37 @@ main() {
     done
     
     echo ""
-    echo ""
-    echo ""
-    log_info "======================================================="
-    log_info "FINAL RESULTS"
-    log_info "======================================================="
+    echo "============================================================"
+    echo "                  FINAL RESULTS"
     log_info "Total files processed: ${#changed_files_array[@]}"
     log_info "Activities succeeded: $success_count"
     log_info "Activities failed: $error_count"
     log_info "Files skipped: ${#skipped_files[@]}"
-    log_info "======================================================="
     echo ""
- 
     
     if [[ ${#succeeded_activities[@]} -gt 0 ]]; then
-        log_success "SUCCEEDED ACTIVITIES:"
+        log_info "SUCCEEDED ACTIVITIES:"
         for activity in "${succeeded_activities[@]}"; do
-            log_success " - $activity"
+            log_info " * $activity"
         done
-        echo ""
     fi
     
     if [[ ${#failed_activities[@]} -gt 0 ]]; then
         log_error "FAILED ACTIVITIES:"
         for activity in "${failed_activities[@]}"; do
-            log_error " - $activity"
+            log_error " * $activity"
         done
-        echo ""
     fi
     
     if [[ ${#skipped_files[@]} -gt 0 ]]; then
         log_warning "SKIPPED FILES:"
         for file in "${skipped_files[@]}"; do
-            log_warning " - $file"
+            log_warning " * $file"
         done
-        echo ""
     fi
+
+    echo "============================================================"
+    echo ""
         
     if [[ $error_count -gt 0 ]]; then 
         exit 1

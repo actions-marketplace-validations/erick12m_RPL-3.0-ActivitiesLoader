@@ -1,8 +1,0 @@
-activities/77/rust_io_test_example/activity.json
-activities/77/rust_io_test_example/files_metadata
-activities/77/rust_io_test_example/io_tests.json
-activities/77/rust_io_test_example/main.rs
-activities/77/rust_unit_test_example/activity.json
-activities/77/rust_unit_test_example/files_metadata
-activities/77/rust_unit_test_example/lib.rs
-activities/77/rust_unit_test_example/unit_tests.rs

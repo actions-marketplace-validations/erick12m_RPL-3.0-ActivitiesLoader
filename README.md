@@ -7,8 +7,8 @@ A GitHub Action that automatically detects and uploads modified/created activiti
 This actions do the following:
 
 1. **Detects Changes**: Monitors the `activities` directory for any modified or created files
-2. **Authenticates**: Logs into the RPL 3.0 platform using provided credentials
-3. **Processes Activities**: Uploads activity data, files, and metadata to the platform
+2. **Authenticates**: Logs into the RPL 3.0 platform using provided credentials (must have teacher permissions on the target course)
+3. **Processes Activities**: Uploads activity and tests files to the API
 4. **Handles Categories**: Creates or updates activity categories as needed
 
 ## Activity Structure
@@ -40,30 +40,32 @@ activities/
     "name": "Hello World",
     "description": "A simple Hello World program to get started with Python",
     "language": "python",
-    "points": 100,
+    "points": 10,
     "active": true,
     "compilation_flags": ""
   }
   ```
 
-- **`files_metadata`**: Defines the files permissions for students. Display can be: `read`, `read_write`, `hidden`. 
+- **`files_metadata`**: Defines the file permissions for students. Display can be: `read`, `read_write`, `hidden`. 
   ```json
   {
-    "main.py": {
+    "file.extension": {
       "display": "read_write"
+    },
+    "file2.extension": {
+      "display": "read"
+    },
+    "file3.extension": {
+      "display": "hidden"
     }
   }
   ```
   
 ### Optional Files
 
-It can be a unit test or IO test for each activity.
+It can be a unit test suite or IO test for each activity.
 
-- **`unit_tests.*`**: A unit test for the activity. It can be any extension for supported languages, currently: `.py`, `rs`, `.c`, `.go`.
-  ```python
-  def test_basic_functionality():
-    assert 1 + 1 == 2
-  ```
+- **`unit_tests.*`**: The test suite for the activity. The extension can currently be: `.py`, `rs`, `.c`, or `.go`.
 
 - **`io_test.json`**: An IO test for the activity.
  ```json
@@ -76,7 +78,6 @@ It can be a unit test or IO test for each activity.
  ]
  ```
 
-
 ## Usage
 
 Add this action to your workflow:
@@ -86,8 +87,6 @@ name: Upload Activities to RPL 3.0
 
 on:
   push:
-    branches: [ main ]
-  pull_request:
     branches: [ main ]
 
 jobs:
@@ -107,7 +106,6 @@ jobs:
           activities_dir: activities # The directory containing the activities in the repository
 ```
 
-
 ## Required Secrets
 
 You must set up the following secrets in your repository:
@@ -118,24 +116,12 @@ You must set up the following secrets in your repository:
 ### `RPL_PASSWORD`
 Your RPL 3.0 platform password
 
-
 ### Setting up Secrets
 
 1. Go to your repository on GitHub
 2. Navigate to **Settings** → **Secrets and variables** → **Actions**
 3. Click **New repository secret**
 4. Add each secret with the appropriate name and value
-
-## How It Works
-
-1. **Change Detection**: The action compares the current commit with the previous one to identify modified files in the activities directory
-2. **Authentication**: Uses provided credentials to authenticate with the RPL 3.0 Users API
-3. **Activity Processing**: For each changed activity:
-   - Creates or updates the activity category
-   - Uploads the activity metadata
-   - Uploads associated files with proper metadata
-
-
 
 ## Troubleshooting
 
@@ -145,21 +131,46 @@ Your RPL 3.0 platform password
    - Verify your `RPL_USERNAME` and `RPL_PASSWORD` secrets are correct
    - Ensure your account has the necessary permissions
 
-2. **No Changes Detected**
+2. **API Health Check Failed**
+   - Verify the API endpoints are accessible
+   - Check if there are network connectivity issues
+
+3. **files_metadata Validation Failed**
+   - Ensure the files_metadata file exists
+   - Verify JSON syntax is correct
+   - Check that all referenced files exist in the activity directory
+   - Ensure display values are only: `read`, `read_write`, or `hidden`
+
+4. **No Changes Detected**
    - Make sure you're using `fetch-depth: 2` in the checkout action
    - Verify changes are in the correct `activities` directory
 
-3. **File Upload Failures**
+5. **File Upload Failures**
    - Ensure activity files follow the required structure
    - Check that `activity.json` and `files_metadata` are properly formatted
 
-## Manual Testing
 
-You can test the action manually by running the following command:
+## Manual testing
+
+You can check the output of the changes detection script manually by running the following command:
+
 ```bash
 ./detect_changes.sh > changes.txt
-cat changes.txt | RPL_USERNAME=your_username RPL_PASSWORD=your_password RPL_USERS_API_BASE_URL=http://localhost:30001 RPL_ACTIVITIES_API_BASE_URL=http://localhost:30001 ./process_activities_changes.sh
 ```
 
-Ensure to use the correct credentials and API URLs for your RPL 3.0 local testing instance.
-You can also use the changes.txt file directly to test the action.
+---
+
+## Development testing (DEVELOPMENT ONLY, FOR DEBUGGING PURPOSES)
+
+
+> [!CAUTION]
+> Note that this is for testing of a local instance of RPL 3.0, not intended for normal usage.
+> It can be used, but if the url parameters point to the production APIs it WILL AFFECT your course and activities, so use with caution. We also discourage using this manually since your credentials will be exposed in the command line history (which is not the case when using the GitHub Action since you define the credentials as secrets).
+
+If you are testing a local instance of RPL 3.0, you can run the following commands manually process them on your local environment:
+```bash
+./detect_changes.sh > changes.txt
+cat changes.txt | RPL_USERNAME=your_username RPL_PASSWORD=your_password USERS_API_BASE_URL=http://localhost:8000/api/v3 ACTIVITIES_API_BASE_URL=http://localhost:8001/api/v3 ./process_activities_changes.sh
+```
+
+Ensure to use the correct credentials and API URLs for your RPL 3.0 local testing instance (the previous example uses the docker-compose setup)

@@ -21,17 +21,17 @@ log_error() {
 # Get changed files from git
 get_changed_activities_files() {
     local changed_files
-    
+
     # Check if there is a previous commit
     if git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
-        changed_files=$(git diff --name-only HEAD~1 HEAD)
+        # Get changed files with status, exclude deleted, output only file names
+        changed_files=$(git diff --name-status HEAD~1 HEAD | awk '$1 != "D" {print $2}')
     else
         # If no previous commit, get all files
         changed_files=$(git ls-files)
     fi
 
     local changed_activities_files
-
     changed_activities_files=$(echo "$changed_files" | grep "^$ACTIVITIES_DIR/" || true)
     echo "$changed_activities_files"
 }
