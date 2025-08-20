@@ -1,7 +1,0 @@
-[
-    {
-      "name": "Test basic functionality",
-      "test_in": "Hello World",
-      "test_out": "Hello World"
-    }
-]  
